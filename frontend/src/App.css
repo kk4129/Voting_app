@@ -1,0 +1,222 @@
+:root {
+  --primary-color: #6366F1; /* A modern purple, similar to the 'Sign Up' button */
+  --primary-hover: #4F46E5;
+  --dark-color: #1F2937; /* For dark buttons and text */
+  --secondary-color: #6B7280; /* For secondary text */
+  --background-color: #F9FAFB; /* A very light grey, almost white */
+  --surface-color: #FFFFFF;
+  --border-color: #E5E7EB;
+  --success-color: #10B981;
+  --error-color: #EF4444;
+}
+
+body {
+  margin: 0;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: var(--background-color);
+  color: var(--dark-color);
+}
+
+.App {
+  text-align: center;
+}
+
+/* --- Header --- */
+.app-header {
+  background-color: var(--surface-color);
+  padding: 1rem 2rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.logo {
+  font-size: 1.75rem;
+  font-weight: 700;
+  color: var(--primary-color);
+  text-decoration: none;
+}
+
+.app-header nav a {
+  margin: 0 1rem;
+  text-decoration: none;
+  color: var(--secondary-color);
+  font-weight: 500;
+  transition: color 0.2s ease-in-out;
+}
+
+.app-header nav a:hover {
+  color: var(--primary-color);
+}
+
+/* --- Main Content & Layout --- */
+main {
+  padding: 2rem 1rem;
+}
+
+.page-container {
+  max-width: 960px;
+  margin: 0 auto;
+  text-align: left;
+}
+
+.page-container h2 {
+    font-size: 2.5rem;
+    font-weight: 700;
+    text-align: center;
+    margin-bottom: 1rem;
+}
+
+.page-description {
+  font-size: 1.2rem;
+  color: var(--secondary-color);
+  margin-bottom: 3rem;
+  text-align: center;
+  max-width: 600px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* --- Cards --- */
+.card {
+  background: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 2rem;
+  margin-bottom: 1.5rem;
+  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.05), 0 2px 4px -2px rgb(0 0 0 / 0.05);
+}
+
+.card-container {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1.5rem;
+  text-align: center;
+}
+
+.card h3 {
+  margin-top: 0;
+  font-size: 1.25rem;
+}
+
+/* --- Buttons --- */
+.button, button {
+  display: inline-block;
+  background-color: var(--primary-color);
+  color: white;
+  padding: 12px 24px;
+  border: none;
+  border-radius: 8px;
+  font-size: 1rem;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background-color 0.2s ease-in-out;
+}
+
+button:hover, .button:hover {
+  background-color: var(--primary-hover);
+}
+
+/* --- Forms & Messages --- */
+input[type="text"] {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  font-size: 1rem;
+  box-sizing: border-box; /* Important for width calculation */
+}
+
+.form-group {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+.message {
+  margin: 1rem 0;
+  padding: 1rem;
+  border-radius: 8px;
+  font-weight: 500;
+  border-left: 4px solid;
+}
+
+.message.error {
+  background-color: #fee2e2;
+  color: #991b1b;
+  border-color: #dc2626;
+}
+
+.message.success {
+  background-color: #dcfce7;
+  color: #166534;
+  border-color: #16a34a;
+}
+
+/* --- Specific Component Styles --- */
+.voter-list {
+  list-style-type: none;
+  padding: 0;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.voter-list li {
+  padding: 10px;
+  border-bottom: 1px solid var(--border-color);
+  font-family: 'Courier New', Courier, monospace;
+  font-size: 0.9rem;
+  color: var(--secondary-color);
+}
+.voter-list li:last-child {
+  border-bottom: none;
+}
+
+.candidate-card {
+  text-align: center;
+}
+.candidate-card h4 {
+    font-size: 1.5rem;
+    margin-bottom: 1rem;
+}
+
+/* --- Results & Progress Bars --- */
+.result-bar {
+  margin-bottom: 1.25rem;
+}
+
+.result-info {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+  font-weight: 500;
+}
+
+.progress-bar {
+  background-color: #E5E7EB;
+  border-radius: 8px;
+  height: 24px;
+  overflow: hidden;
+}
+
+.progress {
+  height: 100%;
+  transition: width 0.5s ease-in-out;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  font-size: 0.8rem;
+}
+
+/* Cycling colors for progress bars, inspired by the image */
+.result-bar:nth-child(4n+1) .progress { background-color: #3B82F6; } /* Blue */
+.result-bar:nth-child(4n+2) .progress { background-color: #EC4899; } /* Pink */
+.result-bar:nth-child(4n+3) .progress { background-color: #F59E0B; } /* Amber */
+.result-bar:nth-child(4n+4) .progress { background-color: #8B5CF6; } /* Violet */
