@@ -1,5 +1,5 @@
-# Improved Face Monitoring Backend with Per-Account Registration
-# Better face matching and multiple face detection
+# Robust Face Monitoring Backend v2.0 - OpenCV Only Version
+# Advanced face matching without face_recognition dependency
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -7,10 +7,23 @@ import cv2
 import numpy as np
 import base64
 from datetime import datetime
+import json
+import os
+import pickle
 import hashlib
+from scipy.spatial import distance
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+import warnings
+warnings.filterwarnings('ignore')
 
 app = Flask(__name__)
 CORS(app, origins=['http://localhost:3000'])
+
+# Storage directory for persistent face data
+FACE_DATA_DIR = 'face_database'
+if not os.path.exists(FACE_DATA_DIR):
+    os.makedirs(FACE_DATA_DIR)
 
 # Global CORS handler
 @app.after_request
@@ -20,21 +33,112 @@ def after_request(response):
     response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
     return response
 
-# Per-account face storage: {voter_id: {features, image, registered_at}}
-REGISTERED_FACES = {}
+# In-memory cache for faster access
+FACE_CACHE = {}
 
-# Current session voter
-CURRENT_VOTER_ID = None
-
-# Initialize face detector with multiple cascades for better detection
+# Initialize face detectors and recognizers
 try:
+    # Multiple Haar Cascades for robust detection
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
     face_cascade_alt = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_alt.xml')
     face_cascade_alt2 = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml')
+    face_cascade_alt_tree = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_alt_tree.xml')
     eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
-    print("✓ Face detectors loaded successfully")
+    
+    # Initialize LBPH Face Recognizer
+    face_recognizer = cv2.face.LBPHFaceRecognizer_create(
+        radius=2,
+        neighbors=16,
+        grid_x=8,
+        grid_y=8,
+        threshold=80.0
+    )
+    
+    # Initialize ORB detector for keypoint features
+    orb = cv2.ORB_create(nfeatures=500)
+    
+    # Initialize SIFT if available (better than ORB but patented)
+    try:
+        sift = cv2.SIFT_create(nfeatures=128)
+        SIFT_AVAILABLE = True
+    except:
+        SIFT_AVAILABLE = False
+    
+    print("✓ Face detectors and recognizers loaded successfully")
+    print(f"  SIFT available: {SIFT_AVAILABLE}")
+    
 except Exception as e:
     print(f"Error loading face detectors: {e}")
+
+def get_account_hash(voter_id):
+    """Generate a safe filename from voter ID"""
+    if not voter_id:
+        return None
+    return hashlib.sha256(voter_id.lower().strip().encode()).hexdigest()[:16]
+
+def save_face_data(voter_id, face_data):
+    """Persist face data to disk"""
+    account_hash = get_account_hash(voter_id)
+    if not account_hash:
+        return False
+    
+    filepath = os.path.join(FACE_DATA_DIR, f"{account_hash}.pkl")
+    
+    try:
+        with open(filepath, 'wb') as f:
+            pickle.dump(face_data, f)
+        
+        FACE_CACHE[voter_id.lower().strip()] = face_data
+        print(f"✓ Face data saved for {voter_id[:10]}...")
+        return True
+    except Exception as e:
+        print(f"Error saving face data: {e}")
+        return False
+
+def load_face_data(voter_id):
+    """Load face data from disk"""
+    voter_key = voter_id.lower().strip()
+    
+    # Check cache first
+    if voter_key in FACE_CACHE:
+        return FACE_CACHE[voter_key]
+    
+    account_hash = get_account_hash(voter_id)
+    if not account_hash:
+        return None
+    
+    filepath = os.path.join(FACE_DATA_DIR, f"{account_hash}.pkl")
+    
+    if not os.path.exists(filepath):
+        return None
+    
+    try:
+        with open(filepath, 'rb') as f:
+            face_data = pickle.load(f)
+        
+        FACE_CACHE[voter_key] = face_data
+        print(f"✓ Face data loaded for {voter_id[:10]}...")
+        return face_data
+    except Exception as e:
+        print(f"Error loading face data: {e}")
+        return None
+
+def delete_face_data(voter_id):
+    """Delete face data from disk and cache"""
+    voter_key = voter_id.lower().strip()
+    
+    if voter_key in FACE_CACHE:
+        del FACE_CACHE[voter_key]
+    
+    account_hash = get_account_hash(voter_id)
+    if account_hash:
+        filepath = os.path.join(FACE_DATA_DIR, f"{account_hash}.pkl")
+        if os.path.exists(filepath):
+            os.remove(filepath)
+            print(f"✓ Face data deleted for {voter_id[:10]}...")
+            return True
+    
+    return False
 
 def base64_to_image(base64_string):
     """Convert base64 string to OpenCV image"""
@@ -51,98 +155,150 @@ def base64_to_image(base64_string):
         print(f"Error converting base64 to image: {e}")
         return None
 
-def detect_faces_robust(image):
+def preprocess_face(face_image):
+    """Preprocess face image for better recognition"""
+    # Convert to grayscale
+    if len(face_image.shape) == 3:
+        gray = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = face_image
+    
+    # Resize to standard size
+    standard_size = (150, 150)
+    resized = cv2.resize(gray, standard_size)
+    
+    # Apply histogram equalization for better contrast
+    equalized = cv2.equalizeHist(resized)
+    
+    # Apply bilateral filter to reduce noise while keeping edges sharp
+    filtered = cv2.bilateralFilter(equalized, 9, 75, 75)
+    
+    return filtered
+
+def detect_faces_multi_cascade(image):
     """
-    Robust face detection with multiple cascade classifiers
-    Returns: (status, faces_list)
-    - status: 'NO_FACE', 'ONE_FACE', 'MULTIPLE_FACES', 'ERROR'
-    - faces_list: list of (x, y, w, h) tuples
+    Robust face detection using multiple cascades and validation
     """
     try:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray_eq = cv2.equalizeHist(gray)
         
-        # Apply histogram equalization for better detection
-        gray = cv2.equalizeHist(gray)
+        all_detections = []
         
-        # Try multiple detection methods
-        all_faces = []
+        # Parameters for each cascade
+        cascade_params = [
+            (face_cascade, 1.1, 5, (50, 50)),
+            (face_cascade_alt, 1.1, 4, (50, 50)),
+            (face_cascade_alt2, 1.15, 5, (60, 60)),
+            (face_cascade_alt_tree, 1.1, 5, (50, 50))
+        ]
         
-        # Method 1: Default cascade
-        faces1 = face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(80, 80),
-            flags=cv2.CASCADE_SCALE_IMAGE
-        )
+        # Detect with multiple cascades
+        for cascade, scale, neighbors, min_size in cascade_params:
+            faces = cascade.detectMultiScale(
+                gray_eq,
+                scaleFactor=scale,
+                minNeighbors=neighbors,
+                minSize=min_size,
+                flags=cv2.CASCADE_SCALE_IMAGE
+            )
+            
+            for (x, y, w, h) in faces:
+                all_detections.append((x, y, w, h))
         
-        # Method 2: Alt cascade (more sensitive)
-        faces2 = face_cascade_alt.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=4,
-            minSize=(80, 80)
-        )
+        # Merge overlapping detections using Non-Maximum Suppression
+        merged_faces = non_maximum_suppression(all_detections, overlap_thresh=0.3)
         
-        # Combine detections
-        for (x, y, w, h) in faces1:
-            all_faces.append((x, y, w, h))
-        
-        for (x, y, w, h) in faces2:
-            # Check if this face overlaps with existing detections
-            is_duplicate = False
-            for (ex, ey, ew, eh) in all_faces:
-                # Calculate overlap
-                overlap_x = max(0, min(x + w, ex + ew) - max(x, ex))
-                overlap_y = max(0, min(y + h, ey + eh) - max(y, ey))
-                overlap_area = overlap_x * overlap_y
-                face_area = w * h
-                if overlap_area > face_area * 0.5:  # 50% overlap = duplicate
-                    is_duplicate = True
-                    break
-            if not is_duplicate:
-                all_faces.append((x, y, w, h))
-        
-        # Remove small faces (likely false positives)
-        min_face_area = gray.shape[0] * gray.shape[1] * 0.02  # At least 2% of image
-        valid_faces = [(x, y, w, h) for (x, y, w, h) in all_faces if w * h >= min_face_area]
-        
-        # Validate faces by checking for eyes
-        confirmed_faces = []
-        for (x, y, w, h) in valid_faces:
+        # Validate faces with eye detection and aspect ratio
+        validated_faces = []
+        for (x, y, w, h) in merged_faces:
+            # Check aspect ratio (faces are typically 1:1.2 to 1:1.5)
+            aspect_ratio = h / w
+            if aspect_ratio < 0.8 or aspect_ratio > 2.0:
+                continue
+            
+            # Check for minimum size (at least 3% of image)
+            face_area = w * h
+            image_area = image.shape[0] * image.shape[1]
+            if face_area < image_area * 0.03:
+                continue
+            
+            # Validate with eye detection
             face_roi = gray[y:y+h, x:x+w]
-            eyes = eye_cascade.detectMultiScale(face_roi, scaleFactor=1.1, minNeighbors=3, minSize=(20, 20))
-            # A valid face should have at least 1 eye detected (allowing for partial view)
-            if len(eyes) >= 1:
-                confirmed_faces.append((x, y, w, h))
-            else:
-                # Still include if face is large enough (might be glasses blocking eye detection)
-                if w * h >= min_face_area * 2:
-                    confirmed_faces.append((x, y, w, h))
+            eyes = eye_cascade.detectMultiScale(
+                face_roi,
+                scaleFactor=1.1,
+                minNeighbors=3,
+                minSize=(20, 20)
+            )
+            
+            # Accept face if at least 1 eye detected or face is large enough
+            if len(eyes) >= 1 or face_area > image_area * 0.1:
+                validated_faces.append((x, y, w, h))
         
-        num_faces = len(confirmed_faces)
-        print(f"Faces detected: {num_faces} (raw: {len(all_faces)}, validated: {len(valid_faces)})")
+        num_faces = len(validated_faces)
+        print(f"Detection: {len(all_detections)} raw, {len(merged_faces)} merged, {num_faces} validated")
         
         if num_faces == 0:
             return "NO_FACE", []
         elif num_faces == 1:
-            return "ONE_FACE", confirmed_faces
+            return "ONE_FACE", validated_faces
         else:
-            return "MULTIPLE_FACES", confirmed_faces
+            return "MULTIPLE_FACES", validated_faces
             
     except Exception as e:
-        print(f"Error detecting faces: {e}")
+        print(f"Error in face detection: {e}")
         return "ERROR", []
 
-def extract_face_features(image, face_coords):
+def non_maximum_suppression(boxes, overlap_thresh=0.3):
+    """Apply Non-Maximum Suppression to merge overlapping detections"""
+    if len(boxes) == 0:
+        return []
+    
+    boxes = np.array(boxes)
+    
+    # Compute area of boxes
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 0] + boxes[:, 2]
+    y2 = boxes[:, 1] + boxes[:, 3]
+    
+    areas = boxes[:, 2] * boxes[:, 3]
+    
+    # Sort by y2 (bottom of box)
+    idxs = np.argsort(y2)
+    
+    picked = []
+    
+    while len(idxs) > 0:
+        last = len(idxs) - 1
+        i = idxs[last]
+        picked.append(i)
+        
+        # Find overlap with all other boxes
+        xx1 = np.maximum(x1[i], x1[idxs[:last]])
+        yy1 = np.maximum(y1[i], y1[idxs[:last]])
+        xx2 = np.minimum(x2[i], x2[idxs[:last]])
+        yy2 = np.minimum(y2[i], y2[idxs[:last]])
+        
+        w = np.maximum(0, xx2 - xx1)
+        h = np.maximum(0, yy2 - yy1)
+        
+        overlap = (w * h) / areas[idxs[:last]]
+        
+        # Delete boxes with high overlap
+        idxs = np.delete(idxs, np.concatenate(([last], np.where(overlap > overlap_thresh)[0])))
+    
+    return boxes[picked].tolist()
+
+def extract_face_embeddings(image, face_coords):
     """
-    Extract comprehensive face features for comparison
-    Uses multiple feature types for robust matching
+    Extract comprehensive face embeddings using multiple techniques
     """
     try:
         x, y, w, h = face_coords
         
-        # Add padding around face
+        # Add padding
         padding = int(min(w, h) * 0.1)
         x1 = max(0, x - padding)
         y1 = max(0, y - padding)
@@ -154,119 +310,120 @@ def extract_face_features(image, face_coords):
         if face_region.size == 0:
             return None
         
-        # Resize to standard size for consistent comparison
-        standard_size = (128, 128)
-        face_resized = cv2.resize(face_region, standard_size)
+        # Preprocess face
+        face_processed = preprocess_face(face_region)
         
-        # Convert to different color spaces
-        gray_face = cv2.cvtColor(face_resized, cv2.COLOR_BGR2GRAY)
-        hsv_face = cv2.cvtColor(face_resized, cv2.COLOR_BGR2HSV)
+        embeddings = {}
         
-        # Normalize lighting
-        gray_face = cv2.equalizeHist(gray_face)
+        # 1. LBPH (Local Binary Pattern Histogram)
+        lbph_hist = compute_lbph_histogram(face_processed)
+        embeddings['lbph'] = lbph_hist
         
-        # Apply slight blur to reduce noise
-        gray_face = cv2.GaussianBlur(gray_face, (3, 3), 0)
+        # 2. HOG (Histogram of Oriented Gradients)
+        hog_features = compute_hog_features(face_processed)
+        embeddings['hog'] = hog_features
         
-        features = {}
+        # 3. Gabor Wavelets
+        gabor_features = compute_gabor_features(face_processed)
+        embeddings['gabor'] = gabor_features
         
-        # 1. Grayscale histogram (256 bins)
-        hist_gray = cv2.calcHist([gray_face], [0], None, [256], [0, 256])
-        cv2.normalize(hist_gray, hist_gray, 0, 1, cv2.NORM_MINMAX)
-        features['hist_gray'] = hist_gray.flatten()
+        # 4. Keypoint descriptors (SIFT or ORB)
+        if SIFT_AVAILABLE:
+            keypoints, descriptors = sift.detectAndCompute(face_processed, None)
+            if descriptors is not None and len(descriptors) > 0:
+                # Take mean of descriptors as feature
+                embeddings['sift'] = np.mean(descriptors, axis=0)
+            else:
+                embeddings['sift'] = np.zeros(128)
+        else:
+            keypoints, descriptors = orb.detectAndCompute(face_processed, None)
+            if descriptors is not None and len(descriptors) > 0:
+                embeddings['orb'] = np.mean(descriptors.astype(float), axis=0)
+            else:
+                embeddings['orb'] = np.zeros(32)
         
-        # 2. Color histograms (HSV)
-        hist_h = cv2.calcHist([hsv_face], [0], None, [180], [0, 180])
-        hist_s = cv2.calcHist([hsv_face], [1], None, [256], [0, 256])
-        cv2.normalize(hist_h, hist_h, 0, 1, cv2.NORM_MINMAX)
-        cv2.normalize(hist_s, hist_s, 0, 1, cv2.NORM_MINMAX)
-        features['hist_hue'] = hist_h.flatten()
-        features['hist_saturation'] = hist_s.flatten()
+        # 5. Statistical features
+        embeddings['statistical'] = compute_statistical_features(face_processed)
         
-        # 3. Local Binary Pattern (LBP) - texture features
-        lbp = compute_lbp(gray_face)
-        hist_lbp = cv2.calcHist([lbp], [0], None, [256], [0, 256])
-        cv2.normalize(hist_lbp, hist_lbp, 0, 1, cv2.NORM_MINMAX)
-        features['hist_lbp'] = hist_lbp.flatten()
+        # 6. Face geometry (landmarks approximation using edges)
+        embeddings['geometry'] = compute_geometric_features(face_processed)
         
-        # 4. Edge features using Sobel
-        sobelx = cv2.Sobel(gray_face, cv2.CV_64F, 1, 0, ksize=3)
-        sobely = cv2.Sobel(gray_face, cv2.CV_64F, 0, 1, ksize=3)
-        edge_magnitude = np.sqrt(sobelx**2 + sobely**2)
-        edge_direction = np.arctan2(sobely, sobelx)
+        # 7. Color features (if color image)
+        if len(image.shape) == 3:
+            embeddings['color'] = compute_color_features(face_region)
         
-        hist_edge_mag = cv2.calcHist([edge_magnitude.astype(np.float32)], [0], None, [64], [0, 255])
-        cv2.normalize(hist_edge_mag, hist_edge_mag, 0, 1, cv2.NORM_MINMAX)
-        features['hist_edge_magnitude'] = hist_edge_mag.flatten()
+        # Store the processed face for LBPH recognizer
+        embeddings['processed_face'] = face_processed
         
-        # 5. Divide face into regions and compute regional features
-        regions_features = []
-        region_size = standard_size[0] // 4
-        for i in range(4):
-            for j in range(4):
-                region = gray_face[i*region_size:(i+1)*region_size, j*region_size:(j+1)*region_size]
-                regions_features.append(np.mean(region))
-                regions_features.append(np.std(region))
-        features['regional_stats'] = np.array(regions_features)
-        
-        # 6. Structural features
-        features['mean_intensity'] = np.mean(gray_face)
-        features['std_intensity'] = np.std(gray_face)
-        features['face_aspect_ratio'] = w / h
-        
-        # 7. HOG-like features (simplified)
-        hog_features = compute_simple_hog(gray_face)
-        features['hog'] = hog_features
-        
-        return features
+        return embeddings
         
     except Exception as e:
-        print(f"Error extracting features: {e}")
+        print(f"Error extracting embeddings: {e}")
         import traceback
         traceback.print_exc()
         return None
 
-def compute_lbp(gray_image):
-    """Compute Local Binary Pattern"""
-    rows, cols = gray_image.shape
-    lbp = np.zeros_like(gray_image)
+def compute_lbph_histogram(face_gray):
+    """Compute Local Binary Pattern Histogram"""
+    # Divide image into cells
+    cell_size = 16
+    h, w = face_gray.shape
+    cells_x = w // cell_size
+    cells_y = h // cell_size
     
-    for i in range(1, rows - 1):
-        for j in range(1, cols - 1):
-            center = gray_image[i, j]
-            code = 0
-            code |= (gray_image[i-1, j-1] >= center) << 7
-            code |= (gray_image[i-1, j] >= center) << 6
-            code |= (gray_image[i-1, j+1] >= center) << 5
-            code |= (gray_image[i, j+1] >= center) << 4
-            code |= (gray_image[i+1, j+1] >= center) << 3
-            code |= (gray_image[i+1, j] >= center) << 2
-            code |= (gray_image[i+1, j-1] >= center) << 1
-            code |= (gray_image[i, j-1] >= center) << 0
-            lbp[i, j] = code
+    histogram = []
     
-    return lbp
+    for cy in range(cells_y):
+        for cx in range(cells_x):
+            cell = face_gray[cy*cell_size:(cy+1)*cell_size, cx*cell_size:(cx+1)*cell_size]
+            
+            # Compute LBP for cell
+            lbp_image = np.zeros_like(cell)
+            for i in range(1, cell.shape[0]-1):
+                for j in range(1, cell.shape[1]-1):
+                    center = cell[i, j]
+                    code = 0
+                    code |= (cell[i-1, j-1] >= center) << 7
+                    code |= (cell[i-1, j] >= center) << 6
+                    code |= (cell[i-1, j+1] >= center) << 5
+                    code |= (cell[i, j+1] >= center) << 4
+                    code |= (cell[i+1, j+1] >= center) << 3
+                    code |= (cell[i+1, j] >= center) << 2
+                    code |= (cell[i+1, j-1] >= center) << 1
+                    code |= (cell[i, j-1] >= center) << 0
+                    lbp_image[i, j] = code
+            
+            # Compute histogram for cell
+            hist, _ = np.histogram(lbp_image, bins=59, range=(0, 256))
+            histogram.extend(hist)
+    
+    histogram = np.array(histogram, dtype=np.float32)
+    # Normalize
+    histogram = histogram / (np.sum(histogram) + 1e-7)
+    
+    return histogram
 
-def compute_simple_hog(gray_image):
-    """Compute simplified HOG features"""
+def compute_hog_features(face_gray):
+    """Compute Histogram of Oriented Gradients features"""
     # Compute gradients
-    gx = cv2.Sobel(gray_image, cv2.CV_64F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray_image, cv2.CV_64F, 0, 1, ksize=3)
+    gx = cv2.Sobel(face_gray, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(face_gray, cv2.CV_64F, 0, 1, ksize=3)
     
-    # Compute magnitude and direction
+    # Magnitude and direction
     magnitude = np.sqrt(gx**2 + gy**2)
     direction = np.arctan2(gy, gx) * (180 / np.pi) % 180
     
-    # Create histogram of oriented gradients
-    num_bins = 9
-    bin_width = 180 // num_bins
-    
-    # Divide image into cells
+    # Create histogram
     cell_size = 16
-    cells_x = gray_image.shape[1] // cell_size
-    cells_y = gray_image.shape[0] // cell_size
+    num_bins = 9
+    bin_width = 180 / num_bins
+    
+    h, w = face_gray.shape
+    cells_x = w // cell_size
+    cells_y = h // cell_size
     
     hog_features = []
+    
     for cy in range(cells_y):
         for cx in range(cells_x):
             cell_mag = magnitude[cy*cell_size:(cy+1)*cell_size, cx*cell_size:(cx+1)*cell_size]
@@ -275,8 +432,9 @@ def compute_simple_hog(gray_image):
             hist = np.zeros(num_bins)
             for i in range(cell_size):
                 for j in range(cell_size):
-                    bin_idx = int(cell_dir[i, j] // bin_width) % num_bins
-                    hist[bin_idx] += cell_mag[i, j]
+                    if i < cell_mag.shape[0] and j < cell_mag.shape[1]:
+                        bin_idx = int(cell_dir[i, j] / bin_width) % num_bins
+                        hist[bin_idx] += cell_mag[i, j]
             
             # Normalize
             norm = np.linalg.norm(hist)
@@ -285,120 +443,232 @@ def compute_simple_hog(gray_image):
             
             hog_features.extend(hist)
     
-    return np.array(hog_features)
+    return np.array(hog_features, dtype=np.float32)
 
-def compare_faces(features1, features2):
+def compute_gabor_features(face_gray):
+    """Compute Gabor wavelet features"""
+    features = []
+    
+    # Gabor parameters
+    ksize = 31
+    sigma = 4.0
+    lambd = 10.0
+    gamma = 0.5
+    psi = 0
+    
+    # Multiple orientations
+    for theta in np.arange(0, np.pi, np.pi / 8):
+        kernel = cv2.getGaborKernel((ksize, ksize), sigma, theta, lambd, gamma, psi)
+        filtered = cv2.filter2D(face_gray, cv2.CV_8UC3, kernel)
+        
+        # Extract statistics from filtered image
+        features.extend([
+            np.mean(filtered),
+            np.std(filtered),
+            np.percentile(filtered, 25),
+            np.percentile(filtered, 75)
+        ])
+    
+    return np.array(features, dtype=np.float32)
+
+def compute_statistical_features(face_gray):
+    """Compute statistical features from face"""
+    features = []
+    
+    # Global statistics
+    features.extend([
+        np.mean(face_gray),
+        np.std(face_gray),
+        np.median(face_gray),
+        np.percentile(face_gray, 25),
+        np.percentile(face_gray, 75),
+        np.max(face_gray) - np.min(face_gray)  # Range
+    ])
+    
+    # Divide into regions and compute local statistics
+    h, w = face_gray.shape
+    regions = [
+        face_gray[0:h//2, 0:w//2],      # Top-left
+        face_gray[0:h//2, w//2:w],      # Top-right
+        face_gray[h//2:h, 0:w//2],      # Bottom-left
+        face_gray[h//2:h, w//2:w],      # Bottom-right
+        face_gray[h//3:2*h//3, w//3:2*w//3]  # Center
+    ]
+    
+    for region in regions:
+        features.extend([
+            np.mean(region),
+            np.std(region),
+            np.median(region)
+        ])
+    
+    return np.array(features, dtype=np.float32)
+
+def compute_geometric_features(face_gray):
+    """Compute geometric features using edge detection"""
+    # Detect edges
+    edges = cv2.Canny(face_gray, 50, 150)
+    
+    # Find contours
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    features = []
+    
+    if contours:
+        # Find largest contour (likely face outline)
+        largest_contour = max(contours, key=cv2.contourArea)
+        
+        # Compute shape features
+        area = cv2.contourArea(largest_contour)
+        perimeter = cv2.arcLength(largest_contour, True)
+        
+        # Hu moments (shape descriptors)
+        moments = cv2.moments(largest_contour)
+        hu_moments = cv2.HuMoments(moments).flatten()
+        
+        features.extend([
+            area / (face_gray.shape[0] * face_gray.shape[1]),  # Relative area
+            perimeter / (2 * (face_gray.shape[0] + face_gray.shape[1])),  # Relative perimeter
+            4 * np.pi * area / (perimeter ** 2 + 1e-7)  # Circularity
+        ])
+        features.extend(hu_moments[:4])  # First 4 Hu moments
+    else:
+        features.extend([0] * 7)
+    
+    return np.array(features, dtype=np.float32)
+
+def compute_color_features(face_color):
+    """Compute color-based features"""
+    features = []
+    
+    # Convert to different color spaces
+    hsv = cv2.cvtColor(face_color, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(face_color, cv2.COLOR_BGR2LAB)
+    
+    # HSV statistics (mainly for skin tone)
+    h, s, v = cv2.split(hsv)
+    features.extend([
+        np.mean(h), np.std(h),
+        np.mean(s), np.std(s),
+        np.mean(v), np.std(v)
+    ])
+    
+    # LAB statistics
+    l, a, b = cv2.split(lab)
+    features.extend([
+        np.mean(l), np.std(l),
+        np.mean(a), np.std(a),
+        np.mean(b), np.std(b)
+    ])
+    
+    return np.array(features, dtype=np.float32)
+
+def compare_face_embeddings(embeddings1, embeddings2):
     """
-    Compare two face feature sets
-    Returns similarity score between 0 and 1
+    Compare two face embeddings using multiple similarity metrics
     """
     try:
-        if features1 is None or features2 is None:
+        if not embeddings1 or not embeddings2:
             return 0.0
         
         similarities = []
         weights = []
         
-        # 1. Compare grayscale histograms (weight: 0.15)
-        if 'hist_gray' in features1 and 'hist_gray' in features2:
-            sim = cv2.compareHist(
-                features1['hist_gray'].reshape(-1, 1).astype(np.float32),
-                features2['hist_gray'].reshape(-1, 1).astype(np.float32),
-                cv2.HISTCMP_CORREL
-            )
-            similarities.append(max(0, sim))
-            weights.append(0.15)
+        # 1. LBPH comparison (most important for face recognition)
+        if 'lbph' in embeddings1 and 'lbph' in embeddings2:
+            lbph_sim = 1.0 - min(1.0, distance.euclidean(embeddings1['lbph'], embeddings2['lbph']) / 10)
+            similarities.append(lbph_sim)
+            weights.append(0.30)
         
-        # 2. Compare LBP histograms (weight: 0.25) - Most important for face recognition
-        if 'hist_lbp' in features1 and 'hist_lbp' in features2:
-            sim = cv2.compareHist(
-                features1['hist_lbp'].reshape(-1, 1).astype(np.float32),
-                features2['hist_lbp'].reshape(-1, 1).astype(np.float32),
-                cv2.HISTCMP_CORREL
-            )
-            similarities.append(max(0, sim))
+        # 2. HOG comparison
+        if 'hog' in embeddings1 and 'hog' in embeddings2:
+            hog_sim = 1.0 - distance.cosine(embeddings1['hog'], embeddings2['hog'])
+            similarities.append(max(0, hog_sim))
             weights.append(0.25)
         
-        # 3. Compare HOG features (weight: 0.25)
-        if 'hog' in features1 and 'hog' in features2:
-            hog1 = features1['hog']
-            hog2 = features2['hog']
-            if len(hog1) == len(hog2) and len(hog1) > 0:
-                # Cosine similarity
-                dot_product = np.dot(hog1, hog2)
-                norm1 = np.linalg.norm(hog1)
-                norm2 = np.linalg.norm(hog2)
-                if norm1 > 0 and norm2 > 0:
-                    sim = dot_product / (norm1 * norm2)
-                    similarities.append(max(0, sim))
-                    weights.append(0.25)
+        # 3. Gabor comparison
+        if 'gabor' in embeddings1 and 'gabor' in embeddings2:
+            gabor_sim = 1.0 - distance.cosine(embeddings1['gabor'], embeddings2['gabor'])
+            similarities.append(max(0, gabor_sim))
+            weights.append(0.15)
         
-        # 4. Compare regional statistics (weight: 0.15)
-        if 'regional_stats' in features1 and 'regional_stats' in features2:
-            reg1 = features1['regional_stats']
-            reg2 = features2['regional_stats']
-            if len(reg1) == len(reg2):
-                # Normalized correlation
-                reg1_norm = (reg1 - np.mean(reg1)) / (np.std(reg1) + 1e-6)
-                reg2_norm = (reg2 - np.mean(reg2)) / (np.std(reg2) + 1e-6)
-                sim = np.corrcoef(reg1_norm, reg2_norm)[0, 1]
-                if not np.isnan(sim):
-                    similarities.append(max(0, sim))
-                    weights.append(0.15)
+        # 4. SIFT/ORB comparison
+        if 'sift' in embeddings1 and 'sift' in embeddings2:
+            sift_sim = 1.0 - distance.cosine(embeddings1['sift'], embeddings2['sift'])
+            similarities.append(max(0, sift_sim))
+            weights.append(0.20)
+        elif 'orb' in embeddings1 and 'orb' in embeddings2:
+            orb_sim = 1.0 - distance.cosine(embeddings1['orb'], embeddings2['orb'])
+            similarities.append(max(0, orb_sim))
+            weights.append(0.15)
         
-        # 5. Compare edge magnitude histograms (weight: 0.10)
-        if 'hist_edge_magnitude' in features1 and 'hist_edge_magnitude' in features2:
-            sim = cv2.compareHist(
-                features1['hist_edge_magnitude'].reshape(-1, 1).astype(np.float32),
-                features2['hist_edge_magnitude'].reshape(-1, 1).astype(np.float32),
-                cv2.HISTCMP_CORREL
-            )
-            similarities.append(max(0, sim))
-            weights.append(0.10)
-        
-        # 6. Compare hue histogram (weight: 0.05) - Skin tone
-        if 'hist_hue' in features1 and 'hist_hue' in features2:
-            sim = cv2.compareHist(
-                features1['hist_hue'].reshape(-1, 1).astype(np.float32),
-                features2['hist_hue'].reshape(-1, 1).astype(np.float32),
-                cv2.HISTCMP_CORREL
-            )
-            similarities.append(max(0, sim))
+        # 5. Statistical features
+        if 'statistical' in embeddings1 and 'statistical' in embeddings2:
+            stat_sim = 1.0 - min(1.0, distance.euclidean(
+                embeddings1['statistical'] / (np.max(embeddings1['statistical']) + 1e-7),
+                embeddings2['statistical'] / (np.max(embeddings2['statistical']) + 1e-7)
+            ))
+            similarities.append(stat_sim)
             weights.append(0.05)
         
-        # 7. Compare structural features (weight: 0.05)
-        if all(k in features1 and k in features2 for k in ['mean_intensity', 'std_intensity']):
-            mean_diff = abs(features1['mean_intensity'] - features2['mean_intensity'])
-            std_diff = abs(features1['std_intensity'] - features2['std_intensity'])
-            struct_sim = 1.0 - min((mean_diff + std_diff) / 100, 1.0)
-            similarities.append(max(0, struct_sim))
+        # 6. Geometric features
+        if 'geometry' in embeddings1 and 'geometry' in embeddings2:
+            geo_sim = 1.0 - distance.cosine(embeddings1['geometry'], embeddings2['geometry'])
+            similarities.append(max(0, geo_sim))
             weights.append(0.05)
+        
+        # 7. Color features
+        if 'color' in embeddings1 and 'color' in embeddings2:
+            color_sim = 1.0 - distance.cosine(embeddings1['color'], embeddings2['color'])
+            similarities.append(max(0, color_sim))
+            weights.append(0.05)
+        
+        # 8. Use LBPH recognizer if faces available
+        if 'processed_face' in embeddings1 and 'processed_face' in embeddings2:
+            try:
+                # Train recognizer on registered face
+                face_recognizer.train([embeddings1['processed_face']], np.array([0]))
+                
+                # Predict on current face
+                label, confidence = face_recognizer.predict(embeddings2['processed_face'])
+                
+                # Convert confidence to similarity (lower confidence = higher similarity)
+                # LBPH confidence typically ranges from 0 to 100
+                lbph_recognizer_sim = max(0, 1 - (confidence / 100))
+                similarities.append(lbph_recognizer_sim)
+                weights.append(0.35)  # High weight for dedicated recognizer
+            except:
+                pass
         
         # Calculate weighted average
         if len(similarities) > 0:
-            total_weight = sum(weights)
-            weighted_sum = sum(s * w for s, w in zip(similarities, weights))
-            final_similarity = weighted_sum / total_weight
+            # Normalize weights
+            total_weight = sum(weights[:len(similarities)])
+            normalized_weights = [w / total_weight for w in weights[:len(similarities)]]
             
-            # Apply non-linear transformation to make differences more pronounced
-            # This helps distinguish between same person (high similarity) and different people
-            final_similarity = final_similarity ** 1.5  # Power transformation
+            # Weighted average
+            final_similarity = sum(s * w for s, w in zip(similarities, normalized_weights))
             
-            return max(0, min(1, final_similarity))
+            # Apply non-linear transformation for better discrimination
+            # This makes the difference between same/different faces more pronounced
+            if final_similarity > 0.6:
+                final_similarity = 0.6 + (final_similarity - 0.6) * 1.5
+            else:
+                final_similarity = final_similarity * 0.9
+            
+            final_similarity = max(0, min(1, final_similarity))
+            
+            print(f"Similarities - LBPH: {similarities[0]:.3f}, HOG: {similarities[1] if len(similarities) > 1 else 0:.3f}, Final: {final_similarity:.3f}")
+            
+            return final_similarity
         else:
             return 0.0
             
     except Exception as e:
-        print(f"Error comparing faces: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Error comparing embeddings: {e}")
         return 0.0
 
-def get_voter_hash(voter_id):
-    """Get normalized voter ID hash for consistent storage"""
-    if voter_id:
-        return voter_id.lower().strip()
-    return None
+# API Endpoints
 
 @app.route('/health', methods=['GET', 'OPTIONS'])
 def health():
@@ -406,22 +676,22 @@ def health():
     if request.method == 'OPTIONS':
         return '', 204
     
-    voter_hash = get_voter_hash(CURRENT_VOTER_ID)
-    is_registered = voter_hash in REGISTERED_FACES if voter_hash else False
+    registered_count = 0
+    if os.path.exists(FACE_DATA_DIR):
+        registered_count = len([f for f in os.listdir(FACE_DATA_DIR) if f.endswith('.pkl')])
     
     return jsonify({
         'status': 'running',
-        'face_registered': is_registered,
-        'voter_id': CURRENT_VOTER_ID,
-        'total_registered_voters': len(REGISTERED_FACES),
+        'total_registered_voters': registered_count,
+        'cache_size': len(FACE_CACHE),
+        'opencv_version': cv2.__version__,
+        'sift_available': SIFT_AVAILABLE,
         'timestamp': datetime.now().isoformat()
     })
 
 @app.route('/check-registration', methods=['POST', 'OPTIONS'])
 def check_registration():
     """Check if a voter already has a registered face"""
-    global CURRENT_VOTER_ID
-    
     if request.method == 'OPTIONS':
         return '', 204
     
@@ -432,15 +702,14 @@ def check_registration():
         if not voter_id:
             return jsonify({'error': 'No voter ID provided'}), 400
         
-        voter_hash = get_voter_hash(voter_id)
-        CURRENT_VOTER_ID = voter_id
-        
-        is_registered = voter_hash in REGISTERED_FACES
+        face_data = load_face_data(voter_id)
+        is_registered = face_data is not None
         
         return jsonify({
             'registered': is_registered,
             'voterId': voter_id,
-            'message': 'Face already registered' if is_registered else 'Face not registered'
+            'message': 'Face already registered' if is_registered else 'Face not registered',
+            'registeredAt': face_data.get('registered_at') if face_data else None
         })
         
     except Exception as e:
@@ -449,9 +718,7 @@ def check_registration():
 
 @app.route('/register-face', methods=['POST', 'OPTIONS'])
 def register_face():
-    """Register the authorized face for a specific voter account"""
-    global REGISTERED_FACES, CURRENT_VOTER_ID
-    
+    """Register the face for a specific voter account"""
     if request.method == 'OPTIONS':
         return '', 204
         
@@ -467,96 +734,109 @@ def register_face():
         print(f"Force Re-register: {force_reregister}")
         print(f"{'='*60}")
         
-        if not voter_id:
-            return jsonify({'success': False, 'error': 'No voter ID provided'}), 400
+        if not voter_id or not image_base64:
+            return jsonify({
+                'success': False,
+                'error': 'Voter ID and image required'
+            }), 400
         
-        if not image_base64:
-            return jsonify({'success': False, 'error': 'No image provided'}), 400
-        
-        voter_hash = get_voter_hash(voter_id)
-        CURRENT_VOTER_ID = voter_id
-        
-        # Check if already registered
-        if voter_hash in REGISTERED_FACES and not force_reregister:
+        # Check existing registration
+        existing_face = load_face_data(voter_id)
+        if existing_face and not force_reregister:
             return jsonify({
                 'success': False,
                 'error': 'Face already registered for this account',
                 'alreadyRegistered': True,
-                'message': 'This wallet already has a registered face. Use force re-register to update.'
+                'registeredAt': existing_face.get('registered_at')
             }), 400
         
         # Convert base64 to image
         image = base64_to_image(image_base64)
         if image is None:
-            return jsonify({'success': False, 'error': 'Failed to decode image'}), 400
+            return jsonify({
+                'success': False,
+                'error': 'Failed to decode image'
+            }), 400
         
-        print(f"Image size: {image.shape}")
+        print(f"Image shape: {image.shape}")
         
         # Detect faces
-        status, faces = detect_faces_robust(image)
-        print(f"Face detection status: {status}, count: {len(faces)}")
+        status, faces = detect_faces_multi_cascade(image)
         
         if status == "NO_FACE":
             return jsonify({
                 'success': False,
-                'error': 'No face detected. Please ensure your face is clearly visible and well-lit.'
+                'error': 'No face detected. Please ensure your face is clearly visible.'
             }), 400
         
         elif status == "MULTIPLE_FACES":
             return jsonify({
                 'success': False,
-                'error': f'Multiple faces detected ({len(faces)}). Only one person should be in frame for registration.'
+                'error': f'Multiple faces detected ({len(faces)}). Only one person should be in frame.'
             }), 400
         
         elif status == "ONE_FACE":
             face_coords = faces[0]
             
-            # Extract features
-            face_features = extract_face_features(image, face_coords)
-            if face_features is None:
-                return jsonify({'success': False, 'error': 'Failed to extract facial features. Please try again.'}), 400
+            # Extract face embeddings
+            face_embeddings = extract_face_embeddings(image, face_coords)
             
-            # Store registration with voter ID
-            REGISTERED_FACES[voter_hash] = {
-                'features': face_features,
-                'registered_at': datetime.now().isoformat(),
+            if face_embeddings is None:
+                return jsonify({
+                    'success': False,
+                    'error': 'Failed to extract facial features. Please try again.'
+                }), 400
+            
+            # Prepare data for storage
+            face_data = {
+                'voter_id': voter_id,
+                'embeddings': face_embeddings,
                 'face_coords': face_coords,
-                'voter_id': voter_id
+                'registered_at': datetime.now().isoformat(),
+                'image_shape': image.shape
             }
             
-            x, y, w, h = face_coords
-            print(f"✓ Face registered successfully for voter: {voter_id}")
-            print(f"  Face area: {w}x{h}")
-            print(f"  Total registered voters: {len(REGISTERED_FACES)}")
-            
-            return jsonify({
-                'success': True,
-                'message': 'Face registered successfully!',
-                'voterId': voter_id,
-                'faceCoords': {'x': int(x), 'y': int(y), 'width': int(w), 'height': int(h)}
-            })
+            # Save to persistent storage
+            if save_face_data(voter_id, face_data):
+                print(f"✅ Face registered successfully for: {voter_id}")
+                
+                return jsonify({
+                    'success': True,
+                    'message': 'Face registered successfully!',
+                    'voterId': voter_id,
+                    'registeredAt': face_data['registered_at']
+                })
+            else:
+                return jsonify({
+                    'success': False,
+                    'error': 'Failed to save face data'
+                }), 500
         
         else:
-            return jsonify({'success': False, 'error': 'Face detection error. Please try again.'}), 500
+            return jsonify({
+                'success': False,
+                'error': 'Face detection error'
+            }), 500
     
     except Exception as e:
         print(f"Registration error: {e}")
         import traceback
         traceback.print_exc()
-        return jsonify({'success': False, 'error': f'Server error: {str(e)}'}), 500
+        return jsonify({
+            'success': False,
+            'error': f'Server error: {str(e)}'
+        }), 500
 
 @app.route('/verify-face', methods=['POST', 'OPTIONS'])
 def verify_face():
-    """Verify if the current face matches the registered face for the voter"""
-    global CURRENT_VOTER_ID
-    
+    """Verify if the current face matches the registered face"""
     if request.method == 'OPTIONS':
         return '', 204
         
     try:
         data = request.json
         image_base64 = data.get('image')
-        voter_id = data.get('voterId', CURRENT_VOTER_ID)
+        voter_id = data.get('voterId')
         
         if not voter_id:
             return jsonify({
@@ -566,14 +846,14 @@ def verify_face():
                 'similarity': 0.0
             })
         
-        voter_hash = get_voter_hash(voter_id)
+        # Load registered face data
+        registered_face = load_face_data(voter_id)
         
-        # Check if this voter has registered
-        if voter_hash not in REGISTERED_FACES:
+        if not registered_face:
             return jsonify({
                 'verified': False,
                 'reason': 'NOT_REGISTERED',
-                'message': 'No face registered for this account. Please register first.',
+                'message': 'No face registered for this account',
                 'similarity': 0.0
             })
         
@@ -596,13 +876,13 @@ def verify_face():
             })
         
         # Detect faces
-        status, faces = detect_faces_robust(image)
+        status, faces = detect_faces_multi_cascade(image)
         
         if status == "NO_FACE":
             return jsonify({
                 'verified': False,
                 'reason': 'NO_FACE',
-                'message': 'No face detected. Please face the camera.',
+                'message': 'No face detected',
                 'similarity': 0.0
             })
         
@@ -610,47 +890,44 @@ def verify_face():
             return jsonify({
                 'verified': False,
                 'reason': 'MULTIPLE_FACES',
-                'message': f'Multiple faces detected ({len(faces)}). Only the registered voter should be visible.',
+                'message': f'{len(faces)} faces detected. Only one allowed.',
                 'similarity': 0.0
             })
         
         elif status == "ONE_FACE":
-            face_coords = faces[0]
+            # Extract current face embeddings
+            current_embeddings = extract_face_embeddings(image, faces[0])
             
-            # Extract current face features
-            current_features = extract_face_features(image, face_coords)
-            if current_features is None:
+            if current_embeddings is None:
                 return jsonify({
                     'verified': False,
                     'reason': 'FEATURE_ERROR',
-                    'message': 'Failed to process face. Please try again.',
+                    'message': 'Failed to process face',
                     'similarity': 0.0
                 })
             
-            # Get registered features for this voter
-            registered_data = REGISTERED_FACES[voter_hash]
-            registered_features = registered_data['features']
+            # Compare with registered face
+            registered_embeddings = registered_face.get('embeddings')
+            similarity = compare_face_embeddings(registered_embeddings, current_embeddings)
             
-            # Compare faces
-            similarity = compare_faces(registered_features, current_features)
+            print(f"Verification for {voter_id[:10]}... | Similarity: {similarity:.3f}")
             
-            print(f"Voter: {voter_id[:10]}... | Similarity: {similarity:.3f}")
-            
-            # Threshold for matching - STRICTER threshold
-            MATCH_THRESHOLD = 0.55  # 55% similarity required
+            # Threshold for matching
+            MATCH_THRESHOLD = 0.60  # 60% similarity required
             
             if similarity >= MATCH_THRESHOLD:
                 return jsonify({
                     'verified': True,
                     'similarity': float(similarity),
-                    'message': f'Face verified ({similarity:.0%} match)'
+                    'message': f'Face verified ({similarity:.0%} match)',
+                    'threshold': MATCH_THRESHOLD
                 })
             else:
                 return jsonify({
                     'verified': False,
                     'reason': 'FACE_MISMATCH',
                     'similarity': float(similarity),
-                    'message': f'Face does not match registered face ({similarity:.0%}). Need {MATCH_THRESHOLD:.0%}.',
+                    'message': f'Face mismatch ({similarity:.0%} < {MATCH_THRESHOLD:.0%})',
                     'threshold': MATCH_THRESHOLD
                 })
         
@@ -675,32 +952,33 @@ def verify_face():
 
 @app.route('/clear-registration', methods=['POST', 'OPTIONS'])
 def clear_registration():
-    """Clear the registered face for a specific voter"""
-    global REGISTERED_FACES, CURRENT_VOTER_ID
-    
+    """Clear the registered face for a voter"""
     if request.method == 'OPTIONS':
         return '', 204
     
     try:
         data = request.json or {}
-        voter_id = data.get('voterId', CURRENT_VOTER_ID)
+        voter_id = data.get('voterId')
         clear_all = data.get('clearAll', False)
         
         if clear_all:
-            count = len(REGISTERED_FACES)
-            REGISTERED_FACES = {}
-            CURRENT_VOTER_ID = None
+            count = 0
+            if os.path.exists(FACE_DATA_DIR):
+                for file in os.listdir(FACE_DATA_DIR):
+                    if file.endswith('.pkl'):
+                        os.remove(os.path.join(FACE_DATA_DIR, file))
+                        count += 1
+            
+            FACE_CACHE.clear()
             print(f"✓ Cleared all {count} registrations")
+            
             return jsonify({
                 'success': True,
                 'message': f'Cleared all {count} registrations'
             })
         
         if voter_id:
-            voter_hash = get_voter_hash(voter_id)
-            if voter_hash in REGISTERED_FACES:
-                del REGISTERED_FACES[voter_hash]
-                print(f"✓ Cleared registration for voter: {voter_id}")
+            if delete_face_data(voter_id):
                 return jsonify({
                     'success': True,
                     'message': f'Registration cleared for {voter_id}'
@@ -708,72 +986,17 @@ def clear_registration():
             else:
                 return jsonify({
                     'success': False,
-                    'message': 'No registration found for this voter'
+                    'message': 'No registration found'
                 })
         
-        CURRENT_VOTER_ID = None
         return jsonify({
-            'success': True,
-            'message': 'Session cleared'
+            'success': False,
+            'message': 'No voter ID provided'
         })
         
     except Exception as e:
         print(f"Clear error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/set-voter', methods=['POST', 'OPTIONS'])
-def set_voter():
-    """Set the current voter ID for the session"""
-    global CURRENT_VOTER_ID
-    
-    if request.method == 'OPTIONS':
-        return '', 204
-    
-    try:
-        data = request.json
-        voter_id = data.get('voterId')
-        
-        if not voter_id:
-            return jsonify({'error': 'No voter ID provided'}), 400
-        
-        CURRENT_VOTER_ID = voter_id
-        voter_hash = get_voter_hash(voter_id)
-        is_registered = voter_hash in REGISTERED_FACES
-        
-        print(f"Session voter set: {voter_id} (registered: {is_registered})")
-        
-        return jsonify({
-            'success': True,
-            'voterId': voter_id,
-            'isRegistered': is_registered
-        })
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/debug', methods=['GET', 'OPTIONS'])
-def debug():
-    """Debug endpoint"""
-    if request.method == 'OPTIONS':
-        return '', 204
-    
-    return jsonify({
-        'current_voter': CURRENT_VOTER_ID,
-        'total_registered': len(REGISTERED_FACES),
-        'registered_voters': [
-            {
-                'voter_id': data['voter_id'][:10] + '...' if len(data['voter_id']) > 10 else data['voter_id'],
-                'registered_at': data['registered_at']
-            }
-            for data in REGISTERED_FACES.values()
-        ],
-        'detectors_loaded': {
-            'default': not face_cascade.empty(),
-            'alt': not face_cascade_alt.empty(),
-            'alt2': not face_cascade_alt2.empty(),
-            'eye': not eye_cascade.empty()
-        }
-    })
 
 @app.route('/stats', methods=['GET', 'OPTIONS'])
 def stats():
@@ -781,29 +1004,48 @@ def stats():
     if request.method == 'OPTIONS':
         return '', 204
     
+    registered_count = 0
+    if os.path.exists(FACE_DATA_DIR):
+        registered_count = len([f for f in os.listdir(FACE_DATA_DIR) if f.endswith('.pkl')])
+    
     return jsonify({
-        'total_registered_voters': len(REGISTERED_FACES),
-        'current_session_voter': CURRENT_VOTER_ID,
+        'total_registered_voters': registered_count,
+        'cache_size': len(FACE_CACHE),
+        'storage_directory': FACE_DATA_DIR,
+        'opencv_version': cv2.__version__,
+        'sift_available': SIFT_AVAILABLE,
         'server_uptime': datetime.now().isoformat()
     })
 
 if __name__ == '__main__':
     print("=" * 60)
-    print("IMPROVED Face Monitoring Backend")
+    print("ROBUST Face Monitoring Backend v2.0 (OpenCV Edition)")
+    print("=" * 60)
+    print(f"Features:")
+    print(f"  • Advanced multi-cascade face detection")
+    print(f"  • LBPH, HOG, Gabor feature extraction")
+    print(f"  • Persistent storage in: {FACE_DATA_DIR}/")
+    print(f"  • Per-account face registration")
+    print(f"  • SIFT available: {SIFT_AVAILABLE}")
     print("=" * 60)
     print(f"Server: http://localhost:5000")
-    print(f"Match Threshold: 55%")
-    print(f"Features: Per-account registration, LBP, HOG, Multi-cascade")
+    print(f"Match Threshold: 60%")
     print("=" * 60)
-    print("\nEndpoints:")
-    print("  POST /register-face    - Register face for voter")
-    print("  POST /verify-face      - Verify face matches registered")
-    print("  POST /check-registration - Check if voter is registered")
-    print("  POST /set-voter        - Set current session voter")
-    print("  POST /clear-registration - Clear registration")
-    print("  GET  /health           - Health check")
-    print("  GET  /debug            - Debug info")
-    print("  GET  /stats            - Statistics")
+    
+    # Check dependencies
+    try:
+        from scipy import __version__ as scipy_version
+        print(f"✓ SciPy {scipy_version}")
+    except ImportError:
+        print("⚠ SciPy not installed. Run: pip install scipy")
+    
+    try:
+        from sklearn import __version__ as sklearn_version
+        print(f"✓ Scikit-learn {sklearn_version}")
+    except ImportError:
+        print("⚠ Scikit-learn not installed. Run: pip install scikit-learn")
+    
+    print(f"✓ OpenCV {cv2.__version__}")
     print("=" * 60)
     
     app.run(debug=True, port=5000, threaded=True)

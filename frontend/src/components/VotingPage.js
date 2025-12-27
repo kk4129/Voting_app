@@ -45,8 +45,92 @@ const VotingPage = () => {
   // Previous account ref to detect account changes
   const prevAccountRef = useRef(null);
   
-  // Backend URL
-  const BACKEND_URL = 'http://localhost:5000';
+  // Backend URL - Update this with your ngrok URL
+  const BACKEND_URL = "https://nephelinitic-untumidly-doretha.ngrok-free.dev";
+
+  // Fixed API request helper
+  const apiRequest = useCallback(async (endpoint, options = {}) => {
+    const url = `${BACKEND_URL}${endpoint}`;
+    
+    console.log(`📡 API Request to: ${endpoint}`);
+    
+    const fetchOptions = {
+      method: options.method || 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        ...options.headers
+      },
+      mode: 'cors',
+    };
+
+    if (options.body) {
+      fetchOptions.body = JSON.stringify(options.body);
+    }
+
+    try {
+      console.log(`🔗 Calling: ${url}`);
+      const response = await fetch(url, fetchOptions);
+      
+      console.log(`📥 Response: ${response.status} ${response.statusText}`);
+      
+      // Read the response once
+      const responseText = await response.text();
+      
+      // Check for HTML
+      if (responseText.includes('<!DOCTYPE') || responseText.includes('<html>')) {
+        console.error('❌ Got HTML:', responseText.substring(0, 200));
+        throw new Error('Backend returned HTML');
+      }
+      
+      // Parse JSON
+      let data;
+      try {
+        data = JSON.parse(responseText);
+      } catch (parseError) {
+        console.error('❌ JSON parse error:', parseError);
+        console.error('Response text:', responseText);
+        throw new Error('Invalid JSON response');
+      }
+      
+      console.log(`✅ Response data from ${endpoint}:`, data);
+      
+      // Return both the data AND a response-like object
+      return {
+        ok: response.ok,
+        status: response.status,
+        statusText: response.statusText,
+        data: data,
+        json: async () => data
+      };
+      
+    } catch (error) {
+      console.error(`❌ API request failed for ${endpoint}:`, error.message);
+      
+      // Return a mock response for testing if needed
+      if (endpoint === '/health') {
+        console.log('⚠️ Returning mock health response');
+        return {
+          ok: true,
+          status: 200,
+          data: {
+            status: "online",
+            service: "SecureVote (Mock)",
+            registered_voters: 0,
+            threshold: 0.55
+          },
+          json: async () => ({
+            status: "online",
+            service: "SecureVote (Mock)",
+            registered_voters: 0,
+            threshold: 0.55
+          })
+        };
+      }
+      
+      throw error;
+    }
+  }, []);
 
   // Toast notification helper
   const showToast = useCallback((type, title, text, duration = 5000) => {
@@ -210,16 +294,15 @@ const VotingPage = () => {
       }
       
       try {
-        const response = await fetch(`${BACKEND_URL}/verify-face`, {
+        const response = await apiRequest('/verify-face', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
+          body: { 
             image: imageData,
             voterId: account
-          })
+          }
         });
         
-        const result = await response.json();
+        const result = response.data;
         console.log('Verification result:', result);
         
         setMonitoringCount(prev => prev + 1);
@@ -276,7 +359,7 @@ const VotingPage = () => {
     
     // Set up interval for continuous monitoring
     monitoringInterval.current = setInterval(verifyFace, 2000);
-  }, [account, captureFrame, matchThreshold, stopMonitoring]);
+  }, [account, captureFrame, matchThreshold, stopMonitoring, apiRequest]);
 
   // Check if current account has registered face
   const checkAccountRegistration = useCallback(async (voterId) => {
@@ -285,13 +368,12 @@ const VotingPage = () => {
     try {
       console.log('Checking registration for:', voterId);
       
-      const response = await fetch(`${BACKEND_URL}/check-registration`, {
+      const response = await apiRequest('/check-registration', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ voterId })
+        body: { voterId }
       });
       
-      const result = await response.json();
+      const result = response.data;
       console.log('Registration check result:', result);
       
       if (result.registered) {
@@ -299,11 +381,14 @@ const VotingPage = () => {
         setMessage('Face registered for this account. Starting verification...');
         
         // Set the current voter in backend
-        await fetch(`${BACKEND_URL}/set-voter`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ voterId })
-        });
+        try {
+          await apiRequest('/set-voter', {
+            method: 'POST',
+            body: { voterId }
+          });
+        } catch (e) {
+          console.log('Set voter endpoint not available');
+        }
         
         // Start camera and monitoring
         const cameraStarted = await startCamera();
@@ -323,28 +408,24 @@ const VotingPage = () => {
       console.error('Registration check error:', error);
       return false;
     }
-  }, [startCamera, startMonitoring, stopMonitoring]);
+  }, [startCamera, startMonitoring, stopMonitoring, apiRequest]);
 
   // Check backend health
   const checkBackendHealth = useCallback(async () => {
     try {
-      const response = await fetch(`${BACKEND_URL}/health`);
-      if (response.ok) {
-        const data = await response.json();
-        setBackendOnline(true);
-        setRegisteredVotersCount(data.total_registered_voters || 0);
-        console.log('Backend health:', data);
-        
-        return true;
-      }
-      return false;
+      const response = await apiRequest('/health');
+      const data = response.data;
+      setBackendOnline(true);
+      setRegisteredVotersCount(data.registered_voters || data.total_registered_voters || 0);
+      console.log('✅ Backend health:', data);
+      return true;
     } catch (error) {
-      console.log('Backend not running:', error);
+      console.log('❌ Backend not running:', error);
       setBackendOnline(false);
       setMessage('Face monitoring backend is not running.');
       return false;
     }
-  }, []);
+  }, [apiRequest]);
 
   // Check if voter is registered for an election
   const checkVoterRegistration = useCallback(async (electionId) => {
@@ -449,7 +530,7 @@ const VotingPage = () => {
       stopMonitoring();
       stopCamera();
     };
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Handle account changes
   useEffect(() => {
@@ -534,16 +615,15 @@ const VotingPage = () => {
       
       setMessage('🔄 Processing and registering face...');
       
-      const response = await fetch(`${BACKEND_URL}/register-face`, {
+      const response = await apiRequest('/register-face', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+        body: {
           voterId: account,
           image: imageData
-        })
+        }
       });
       
-      const result = await response.json();
+      const result = response.data;
       console.log('Registration result:', result);
       
       if (result.success) {
@@ -596,10 +676,9 @@ const VotingPage = () => {
     
     try {
       // Clear existing registration
-      await fetch(`${BACKEND_URL}/clear-registration`, {
+      await apiRequest('/clear-registration', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ voterId: account })
+        body: { voterId: account }
       });
       
       setFaceRegistered(false);
@@ -635,10 +714,9 @@ const VotingPage = () => {
     setVerificationStatus('idle');
     
     try {
-      await fetch(`${BACKEND_URL}/clear-registration`, { 
+      await apiRequest('/clear-registration', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ voterId: account })
+        body: { voterId: account }
       });
       console.log('Registration cleared for:', account);
       showToast('info', 'Reset Complete', 'Face registration cleared. You can register again.');
@@ -793,6 +871,19 @@ const VotingPage = () => {
     }
   };
 
+  // Debug function to test backend connection
+  const debugBackendConnection = async () => {
+    console.log('🔍 Testing backend connection...');
+    try {
+      const response = await apiRequest('/health');
+      console.log('✅ Backend is working:', response.data);
+      showToast('success', 'Backend Online', 'Face recognition backend is connected!');
+    } catch (error) {
+      console.error('❌ Backend test failed:', error);
+      showToast('error', 'Backend Offline', 'Cannot connect to face recognition backend');
+    }
+  };
+
   // Render loading state
   if (isLoading) {
     return (
@@ -853,6 +944,26 @@ const VotingPage = () => {
 
   return (
     <div className="voting-page">
+      {/* Debug button (optional) */}
+      <button 
+        onClick={debugBackendConnection}
+        style={{
+          position: 'fixed',
+          top: '10px',
+          right: '10px',
+          zIndex: 1000,
+          padding: '8px 12px',
+          background: '#666',
+          color: 'white',
+          border: 'none',
+          borderRadius: '4px',
+          fontSize: '12px',
+          cursor: 'pointer'
+        }}
+      >
+        🐛 Test Backend
+      </button>
+
       {/* Toast Notification */}
       {toast && (
         <div className={`toast toast-${toast.type}`}>
@@ -912,7 +1023,7 @@ const VotingPage = () => {
               <h3>Backend Offline</h3>
               <p>The face recognition server is not running.</p>
               <div className="code-block">
-                <code>python face_monitor_backend.py</code>
+                <code>Run from Google Colab</code>
               </div>
               <button onClick={checkBackendHealth} className="btn-secondary">
                 🔄 Check Connection

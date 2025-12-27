@@ -12,7 +12,7 @@ const NavBar = () => {
   const { isAdmin, owner } = useWeb3();
   return (
     <header className="app-header">
-      <Link to="/" className="logo">VoteChain</Link>
+      <Link to="/" className="logo">SecureVote</Link>
       <nav>
         <Link to="/">Home</Link>
         {isAdmin && <Link to="/admin">Admin Dashboard</Link>}
